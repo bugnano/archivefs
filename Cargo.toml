@@ -9,4 +9,6 @@ edition = "2018"
 [dependencies]
 fuse = { git = "https://github.com/zargony/fuse-rs" }
 libc = "*"
+clap = "*"
+termios = "*"
 
