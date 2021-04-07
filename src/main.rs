@@ -291,7 +291,7 @@ fn main() -> Result<()> {
 		entry_name: String::from("/"),
 	});
 
-	let mut ino = 2;
+	let mut counter: u64 = 2;
 	let mut entry = ArchiveEntry::new();
 	let a = match Archive::read_open_filename(&fs.archive_path, 10240, fs.password.as_deref()) {
 		Ok(a) => a,
@@ -309,26 +309,26 @@ fn main() -> Result<()> {
 		match a.read_next_header(&mut entry) {
 			Ok(()) => {
 				let entry_name = entry.pathname();
-				let mut name = String::from(&entry_name);
+				let mut full_name = String::from(&entry_name);
 
-				if name.starts_with("./") {
-					name = String::from(&name[2..])
+				if full_name.starts_with("./") {
+					full_name = String::from(&full_name[2..])
 				}
 
-				if name.starts_with("/") {
-					name = String::from(&name[1..])
+				if full_name.starts_with("/") {
+					full_name = String::from(&full_name[1..])
 				}
 
-				if name.ends_with("/") {
-					name = String::from(&name[..name.len()-1])
+				if full_name.ends_with("/") {
+					full_name = String::from(&full_name[..full_name.len()-1])
 				}
 
-				if name.is_empty() {
+				if full_name.is_empty() {
 					continue;
 				}
 
 				let st = entry.stat();
-				let kind = match st.st_mode & archive::AE_IFMT {
+				let typ = match st.st_mode & archive::AE_IFMT {
 					archive::AE_IFREG => libc::DT_REG,
 					archive::AE_IFLNK => libc::DT_LNK,
 					archive::AE_IFSOCK => libc::DT_SOCK,
@@ -339,27 +339,47 @@ fn main() -> Result<()> {
 					_ => libc::DT_REG,
 				};
 
-				if kind == libc::DT_DIR {
-					ino_from_dir.insert(String::from(&name), ino);
+				let name: &str;
+				let parent: u64;
+				if let Some(pos) = full_name.rfind('/') {
+					let (parent_name, basename) = full_name.split_at(pos);
+
+					name = &basename[1..];
+
+					if let Some(&parent_ino) = ino_from_dir.get(parent_name) {
+						parent = parent_ino;
+					} else {
+						ino_from_dir.insert(String::from(parent_name), counter);
+						parent = counter;
+						counter += 1;
+					}
+				} else {
+					name = &full_name;
+					parent = ROOT_INO;
 				}
 
-				let mut parent = ROOT_INO;
-				if let Some(pos) = name.rfind('/') {
-					let (parent_name, basename) = name.split_at(pos);
-					if let Some(&ino) = ino_from_dir.get(parent_name) {
-						name = String::from(&basename[1..]);
-						parent = ino;
+				let ino: u64;
+				if typ == libc::DT_DIR {
+					if ino_from_dir.contains_key(&full_name) {
+						ino = ino_from_dir[&full_name];
+					} else {
+						ino_from_dir.insert(String::from(&full_name), counter);
+						ino = counter;
+						counter += 1;
 					}
-				};
+				} else {
+					ino = counter;
+					counter += 1;
+				}
 
 				let dir_contents = fs.directories.entry(parent).or_insert(DirContents::new());
 				dir_contents.children.push(ino);
-				dir_contents.ino_from_name.insert(String::from(&name), ino);
+				dir_contents.ino_from_name.insert(String::from(name), ino);
 
 				let attr = DirEntry {
-					name: name,
+					name: String::from(name),
 					ino: ino,
-					typ: kind as u32,
+					typ: typ as u32,
 
 					size: st.st_size as u64,
 					blksize: 512,
@@ -369,7 +389,7 @@ fn main() -> Result<()> {
 					ctime: Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
 					mode: st.st_mode,
 					nlink: {
-						if (kind == libc::DT_DIR) && (st.st_nlink < 2) {
+						if (typ == libc::DT_DIR) && (st.st_nlink < 2) {
 							2
 						} else if st.st_nlink < 1 {
 							1
@@ -387,8 +407,6 @@ fn main() -> Result<()> {
 
 				println!("{:?}", attr);
 				fs.inodes.insert(ino, attr);
-
-				ino += 1;
 			},
 			Err(e) => {
 				println!("{:?}", e);
