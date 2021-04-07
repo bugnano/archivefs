@@ -25,6 +25,7 @@ use std::{io, os::unix::prelude::*, path::PathBuf, time::Duration};
 use clap::{Arg, App, crate_version};
 use std::os::unix::io::AsRawFd;
 use termios::{Termios, tcsetattr, ECHO, TCSANOW};
+use std::collections::HashMap;
 
 mod archive;
 
@@ -53,6 +54,9 @@ struct DirEntry {
 	uid: u32,
 	gid: u32,
 	rdev: u32,
+
+	entry_name: String,
+	parent_ino: u64,
 }
 
 impl DirEntry {
@@ -73,39 +77,70 @@ impl DirEntry {
 }
 
 #[derive(Debug)]
+struct DirContents {
+	children: Vec<u64>,
+	ino_from_name: HashMap<String, u64>,
+}
+
+impl DirContents {
+	fn new() -> DirContents {
+		DirContents {
+			children: Vec::new(),
+			ino_from_name: HashMap::new(),
+		}
+	}
+}
+
+impl Iterator for DirContents {
+	type Item = (String, u64, u32);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		None
+	}
+}
+
+#[derive(Debug)]
 struct ArchiveFS {
 	archive_path: String,
 	password: Option<String>,
 	entries: Vec<DirEntry>,
+	inodes: HashMap<u64, DirEntry>,
+	directories: HashMap<u64, DirContents>,
 }
 
 impl ArchiveFS {
 	fn lookup(&self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
-		match op.parent() {
-			ROOT_INO if op.name().as_bytes() == HELLO_FILENAME.as_bytes() => {
+		let parent = op.parent();
+
+		if self.directories.contains_key(&parent) {
+			if let Some(&ino) = self.directories[&parent].ino_from_name.get(&op.name().to_string_lossy().into_owned()) {
 				let mut out = EntryOut::default();
-				self.entries[2].fill_attr(out.attr());
-				out.ino(HELLO_INO);
+
+				self.inodes[&ino].fill_attr(out.attr());
+				out.ino(ino);
 				out.ttl_attr(TTL);
 				out.ttl_entry(TTL);
+
 				req.reply(out)
+			} else {
+				req.reply_error(libc::ENOENT)
 			}
-			_ => req.reply_error(libc::ENOENT),
+		} else {
+			req.reply_error(libc::ENOENT)
 		}
 	}
 
 	fn getattr(&self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
 		let mut out = AttrOut::default();
 
-		match op.ino() {
-			ROOT_INO => self.entries[0].fill_attr(out.attr()),
-			HELLO_INO => self.entries[2].fill_attr(out.attr()),
-			_ => return req.reply_error(libc::ENOENT),
-		};
+		if let Some(entry) = self.inodes.get(&op.ino()) {
+			entry.fill_attr(out.attr());
+			out.ttl(TTL);
 
-		out.ttl(TTL);
-
-		req.reply(out)
+			req.reply(out)
+		} else {
+			req.reply_error(libc::ENOENT)
+		}
 	}
 
 	fn read(&self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
@@ -127,7 +162,7 @@ impl ArchiveFS {
 		req.reply(data)
 	}
 
-	fn dir_entries(&self) -> impl Iterator<Item = (u64, &DirEntry)> + '_ {
+	fn dir_entries(&self, ino: u64) -> impl Iterator<Item = (u64, &DirEntry)> + '_ {
 		self.entries.iter().enumerate().map(|(i, ent)| {
 			let offset = (i + 1) as u64;
 			(offset, ent)
@@ -135,19 +170,23 @@ impl ArchiveFS {
 	}
 
 	fn readdir(&self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
-		if op.ino() != ROOT_INO {
+		let ino = op.ino();
+
+		if !self.directories.contains_key(&ino) {
 			return req.reply_error(libc::ENOTDIR);
 		}
 
+
 		let mut out = ReaddirOut::new(op.size() as usize);
 
-		for (i, entry) in self.dir_entries().skip(op.offset() as usize) {
+		for (i, entry) in self.dir_entries(ino).skip(op.offset() as usize) {
 			let full = out.entry(
-				entry.name.as_ref(), //
+				entry.name.as_ref(),
 				entry.ino,
 				entry.typ,
 				i + 1,
 			);
+
 			if full {
 				break;
 			}
@@ -220,10 +259,12 @@ fn main() -> Result<()> {
 			}
 		},
 		entries: Vec::new(),
+		inodes: HashMap::new(),
+		directories: HashMap::new(),
 	};
 
-	fs.entries.push(DirEntry {
-		name: String::from("."),
+	fs.inodes.insert(ROOT_INO, DirEntry {
+		name: String::from(""),
 		ino: ROOT_INO,
 		typ: libc::DT_DIR as u32,
 
@@ -233,28 +274,13 @@ fn main() -> Result<()> {
 		atime: Duration::new(0, 0),
 		mtime: Duration::new(0, 0),
 		ctime: Duration::new(0, 0),
-		mode: (libc::S_IFDIR as u32) | 0o555,
+		mode: libc::S_IFDIR | 0o555,
 		nlink: 2,
 		uid: unsafe { libc::getuid() },
 		gid: unsafe { libc::getgid() },
 		rdev: 0,
-	});
-	fs.entries.push(DirEntry {
-		name: String::from(".."),
-		ino: ROOT_INO,
-		typ: libc::DT_DIR as u32,
-
-		size: 0,
-		blksize: 512,
-		blocks: 0,
-		atime: Duration::new(0, 0),
-		mtime: Duration::new(0, 0),
-		ctime: Duration::new(0, 0),
-		mode: libc::S_IFDIR as u32 | 0o555,
-		nlink: 2,
-		uid: unsafe { libc::getuid() },
-		gid: unsafe { libc::getgid() },
-		rdev: 0,
+		entry_name: String::from("/"),
+		parent_ino: ROOT_INO,
 	});
 
 	let mut ino = 2;
@@ -269,11 +295,31 @@ fn main() -> Result<()> {
 		Err(ArchiveError::Unknown(_, s)) => bail!("{}", s),
 	};
 
+	let mut ino_from_dir: HashMap<String, u64> = HashMap::new();
+
 	loop {
 		match a.read_next_header(&mut entry) {
 			Ok(()) => {
+				let entry_name = entry.pathname();
+				let mut name = String::from(&entry_name);
+
+				if name.starts_with("./") {
+					name = String::from(&name[2..])
+				}
+
+				if name.starts_with("/") {
+					name = String::from(&name[1..])
+				}
+
+				if name.ends_with("/") {
+					name = String::from(&name[..name.len()-1])
+				}
+
+				if name.is_empty() {
+					continue;
+				}
+
 				let st = entry.stat();
-				println!("{}", entry.pathname());
 				let kind = match st.st_mode & archive::AE_IFMT {
 					archive::AE_IFREG => libc::DT_REG,
 					archive::AE_IFLNK => libc::DT_LNK,
@@ -285,8 +331,25 @@ fn main() -> Result<()> {
 					_ => libc::DT_REG,
 				};
 
+				if kind == libc::DT_DIR {
+					ino_from_dir.insert(String::from(&name), ino);
+				}
+
+				let mut parent_ino = ROOT_INO;
+				if let Some(pos) = name.rfind('/') {
+					let (parent_name, basename) = name.split_at(pos);
+					if let Some(&ino) = ino_from_dir.get(parent_name) {
+						name = String::from(&basename[1..]);
+						parent_ino = ino;
+					}
+				};
+
+				let dir_contents = fs.directories.entry(parent_ino).or_insert(DirContents::new());
+				dir_contents.children.push(ino);
+				dir_contents.ino_from_name.insert(String::from(&name), ino);
+
 				let attr = DirEntry {
-					name: entry.pathname(),
+					name: name,
 					ino: ino,
 					typ: kind as u32,
 					size: st.st_size as u64,
@@ -308,10 +371,12 @@ fn main() -> Result<()> {
 					uid: st.st_uid,
 					gid: st.st_gid,
 					rdev: st.st_rdev as u32,
+					entry_name: entry_name,
+					parent_ino: parent_ino,
 				};
+
 				println!("{:?}", attr);
-				println!("{}", st.st_mode);
-				fs.entries.push(attr);
+				fs.inodes.insert(ino, attr);
 
 				ino += 1;
 			},
@@ -321,6 +386,9 @@ fn main() -> Result<()> {
 			}
 		}
 	}
+
+	println!("fs.directories: {:?}", fs.directories);
+	println!("ino_from_dir: {:?}", ino_from_dir);
 
 	let mountpoint = PathBuf::from(matches.value_of("MOUNTPOINT").unwrap());
     ensure!(mountpoint.is_dir(), "MOUNTPOINT must be a directory");
