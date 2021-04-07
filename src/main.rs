@@ -20,12 +20,13 @@ use polyfuse::{
 };
 
 use anyhow::{ensure, Result, bail};
-use std::{io, os::unix::prelude::*, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf, time::Duration};
 
 use clap::{Arg, App, crate_version};
 use std::os::unix::io::AsRawFd;
 use termios::{Termios, tcsetattr, ECHO, TCSANOW};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 
 mod archive;
 
@@ -34,7 +35,6 @@ use archive::{Archive, ArchiveEntry, ArchiveError};
 const TTL: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const ROOT_INO: u64 = 1;
 const HELLO_INO: u64 = 2;
-const HELLO_FILENAME: &str = "hello.txt";
 const HELLO_CONTENT: &[u8] = b"Hello, world!\n";
 
 #[derive(Debug)]
@@ -55,8 +55,8 @@ struct DirEntry {
 	gid: u32,
 	rdev: u32,
 
+	parent: u64,
 	entry_name: String,
-	parent_ino: u64,
 }
 
 impl DirEntry {
@@ -91,19 +91,10 @@ impl DirContents {
 	}
 }
 
-impl Iterator for DirContents {
-	type Item = (String, u64, u32);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		None
-	}
-}
-
 #[derive(Debug)]
 struct ArchiveFS {
 	archive_path: String,
 	password: Option<String>,
-	entries: Vec<DirEntry>,
 	inodes: HashMap<u64, DirEntry>,
 	directories: HashMap<u64, DirContents>,
 }
@@ -162,29 +153,46 @@ impl ArchiveFS {
 		req.reply(data)
 	}
 
-	fn dir_entries(&self, ino: u64) -> impl Iterator<Item = (u64, &DirEntry)> + '_ {
-		self.entries.iter().enumerate().map(|(i, ent)| {
-			let offset = (i + 1) as u64;
-			(offset, ent)
-		})
-	}
-
 	fn readdir(&self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
 		let ino = op.ino();
+		let offset = op.offset();
 
 		if !self.directories.contains_key(&ino) {
 			return req.reply_error(libc::ENOTDIR);
 		}
 
-
 		let mut out = ReaddirOut::new(op.size() as usize);
 
-		for (i, entry) in self.dir_entries(ino).skip(op.offset() as usize) {
-			let full = out.entry(
-				entry.name.as_ref(),
+		let mut entry = &self.inodes[&ino];
+
+		if offset < 1 {
+			out.entry(
+				OsStr::new("."),
+				ino,
+				entry.typ,
+				1,
+			);
+		}
+
+		if offset < 2 {
+			entry = &self.inodes[&entry.parent];
+
+			out.entry(
+				OsStr::new(".."),
 				entry.ino,
 				entry.typ,
-				i + 1,
+				2,
+			);
+		}
+
+		for (i, child_ino) in self.directories[&ino].children.iter().enumerate().skip(offset.saturating_sub(2) as usize) {
+			entry = &self.inodes[&child_ino];
+
+			let full = out.entry(
+				OsStr::new(&entry.name),
+				entry.ino,
+				entry.typ,
+				(i + 3) as u64,
 			);
 
 			if full {
@@ -258,7 +266,6 @@ fn main() -> Result<()> {
 				None
 			}
 		},
-		entries: Vec::new(),
 		inodes: HashMap::new(),
 		directories: HashMap::new(),
 	};
@@ -279,8 +286,9 @@ fn main() -> Result<()> {
 		uid: unsafe { libc::getuid() },
 		gid: unsafe { libc::getgid() },
 		rdev: 0,
+
+		parent: ROOT_INO,
 		entry_name: String::from("/"),
-		parent_ino: ROOT_INO,
 	});
 
 	let mut ino = 2;
@@ -335,16 +343,16 @@ fn main() -> Result<()> {
 					ino_from_dir.insert(String::from(&name), ino);
 				}
 
-				let mut parent_ino = ROOT_INO;
+				let mut parent = ROOT_INO;
 				if let Some(pos) = name.rfind('/') {
 					let (parent_name, basename) = name.split_at(pos);
 					if let Some(&ino) = ino_from_dir.get(parent_name) {
 						name = String::from(&basename[1..]);
-						parent_ino = ino;
+						parent = ino;
 					}
 				};
 
-				let dir_contents = fs.directories.entry(parent_ino).or_insert(DirContents::new());
+				let dir_contents = fs.directories.entry(parent).or_insert(DirContents::new());
 				dir_contents.children.push(ino);
 				dir_contents.ino_from_name.insert(String::from(&name), ino);
 
@@ -352,6 +360,7 @@ fn main() -> Result<()> {
 					name: name,
 					ino: ino,
 					typ: kind as u32,
+
 					size: st.st_size as u64,
 					blksize: 512,
 					blocks: ((st.st_size + 511) / 512) as u64,
@@ -371,8 +380,9 @@ fn main() -> Result<()> {
 					uid: st.st_uid,
 					gid: st.st_gid,
 					rdev: st.st_rdev as u32,
+
+					parent: parent,
 					entry_name: entry_name,
-					parent_ino: parent_ino,
 				};
 
 				println!("{:?}", attr);
