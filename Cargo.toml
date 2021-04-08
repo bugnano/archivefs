@@ -12,4 +12,5 @@ anyhow = "*"
 libc = "*"
 clap = "*"
 termios = "*"
+relative-path = "*"
 

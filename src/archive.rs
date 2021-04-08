@@ -51,6 +51,8 @@ extern {
 	fn archive_entry_free(archive_entry: *mut s_archive_entry);
 	fn archive_entry_pathname(a: *mut s_archive_entry) -> *const c_char;
 	fn archive_entry_stat(a: *mut s_archive_entry) -> *const stat;
+	fn archive_entry_symlink(a: *mut s_archive_entry) -> *const c_char;
+	fn archive_entry_hardlink(a: *mut s_archive_entry) -> *const c_char;
 
 	fn archive_error_string(archive: *mut s_archive) -> *const c_char;
 }
@@ -80,16 +82,16 @@ impl fmt::Display for ArchiveError {
 
 impl error::Error for ArchiveError {}
 
-unsafe fn string_from_pointer(p: *const c_char) -> String {
+unsafe fn string_from_pointer(p: *const c_char) -> Option<String> {
 	if p.is_null() {
-		String::from("")
+		None
 	} else {
-		CStr::from_ptr(p).to_string_lossy().into_owned()
+		Some(CStr::from_ptr(p).to_string_lossy().into_owned())
 	}
 }
 
 fn archive_error_from_int(i: c_int, a: &Archive) -> ArchiveError {
-	let s = unsafe { string_from_pointer(archive_error_string(a.archive)) };
+	let s = unsafe { string_from_pointer(archive_error_string(a.archive)).unwrap_or(String::from("")) };
 
 	match i {
 		ARCHIVE_EOF => ArchiveError::Eof,
@@ -167,7 +169,7 @@ impl ArchiveEntry {
 		}
 	}
 
-	pub fn pathname(&self) -> String {
+	pub fn pathname(&self) -> Option<String> {
 		unsafe { string_from_pointer(archive_entry_pathname(self.archive_entry)) }
 	}
 
@@ -181,6 +183,14 @@ impl ArchiveEntry {
 				*s
 			}
 		}
+	}
+
+	pub fn symlink(&self) -> Option<String> {
+		unsafe { string_from_pointer(archive_entry_symlink(self.archive_entry)) }
+	}
+
+	pub fn hardlink(&self) -> Option<String> {
+		unsafe { string_from_pointer(archive_entry_hardlink(self.archive_entry)) }
 	}
 }
 

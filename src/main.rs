@@ -27,6 +27,7 @@ use std::os::unix::io::AsRawFd;
 use termios::{Termios, tcsetattr, ECHO, TCSANOW};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use relative_path::RelativePath;
 
 mod archive;
 
@@ -57,6 +58,9 @@ struct DirEntry {
 
 	parent: u64,
 	entry_name: String,
+	symlink: Option<String>,
+	hardlink: Option<String>,
+	hardlink_target: u64,
 }
 
 impl DirEntry {
@@ -100,6 +104,20 @@ struct ArchiveFS {
 }
 
 impl ArchiveFS {
+	fn hardlink_ino(&self, ino: u64) -> u64 {
+		if !self.inodes.contains_key(&ino) {
+			return ino;
+		}
+
+		let mut target_ino = ino;
+
+		while self.inodes[&target_ino].hardlink_target != 0 {
+			target_ino = self.inodes[&target_ino].hardlink_target;
+		}
+
+		target_ino
+	}
+
 	fn lookup(&self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
 		let parent = op.parent();
 
@@ -107,8 +125,10 @@ impl ArchiveFS {
 			if let Some(&ino) = self.directories[&parent].ino_from_name.get(&op.name().to_string_lossy().into_owned()) {
 				let mut out = EntryOut::default();
 
-				self.inodes[&ino].fill_attr(out.attr());
-				out.ino(ino);
+				let target_ino = self.hardlink_ino(ino);
+
+				self.inodes[&target_ino].fill_attr(out.attr());
+				out.ino(target_ino);
 				out.ttl_attr(TTL);
 				out.ttl_entry(TTL);
 
@@ -124,11 +144,23 @@ impl ArchiveFS {
 	fn getattr(&self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
 		let mut out = AttrOut::default();
 
-		if let Some(entry) = self.inodes.get(&op.ino()) {
+		if let Some(entry) = self.inodes.get(&self.hardlink_ino(op.ino())) {
 			entry.fill_attr(out.attr());
 			out.ttl(TTL);
 
 			req.reply(out)
+		} else {
+			req.reply_error(libc::ENOENT)
+		}
+	}
+
+	fn readlink(&self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
+		if let Some(entry) = self.inodes.get(&self.hardlink_ino(op.ino())) {
+			if let Some(symlink) = &entry.symlink {
+				req.reply(&symlink)
+			} else {
+				req.reply_error(libc::EINVAL)
+			}
 		} else {
 			req.reply_error(libc::ENOENT)
 		}
@@ -154,7 +186,7 @@ impl ArchiveFS {
 	}
 
 	fn readdir(&self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
-		let ino = op.ino();
+		let ino = self.hardlink_ino(op.ino());
 		let offset = op.offset();
 
 		if !self.directories.contains_key(&ino) {
@@ -175,7 +207,7 @@ impl ArchiveFS {
 		}
 
 		if offset < 2 {
-			entry = &self.inodes[&entry.parent];
+			entry = &self.inodes[&self.hardlink_ino(entry.parent)];
 
 			out.entry(
 				OsStr::new(".."),
@@ -185,11 +217,12 @@ impl ArchiveFS {
 			);
 		}
 
-		for (i, child_ino) in self.directories[&ino].children.iter().enumerate().skip(offset.saturating_sub(2) as usize) {
-			entry = &self.inodes[&child_ino];
+		for (i, &child_ino) in self.directories[&ino].children.iter().enumerate().skip(offset.saturating_sub(2) as usize) {
+			entry = &self.inodes[&self.hardlink_ino(child_ino)];
+			let real_entry = &self.inodes[&child_ino];
 
 			let full = out.entry(
-				OsStr::new(&entry.name),
+				OsStr::new(&real_entry.name),
 				entry.ino,
 				entry.typ,
 				(i + 3) as u64,
@@ -205,15 +238,16 @@ impl ArchiveFS {
 
 	fn statfs(&self, req: &Request, _op: op::Statfs<'_>) -> io::Result<()> {
 		let mut out = StatfsOut::default();
+		let out_statfs = out.statfs();
 
-		out.statfs().bsize(512);
-		out.statfs().frsize(0);
-		out.statfs().blocks(0);
-		out.statfs().bfree(0);
-		out.statfs().bavail(0);
-		out.statfs().files(0);
-		out.statfs().ffree(0);
-		out.statfs().namelen(255);
+		out_statfs.bsize(512);
+		out_statfs.frsize(0);
+		out_statfs.blocks(0);
+		out_statfs.bfree(0);
+		out_statfs.bavail(0);
+		out_statfs.files(0);
+		out_statfs.ffree(0);
+		out_statfs.namelen(255);
 
 		req.reply(out)
 	}
@@ -289,6 +323,9 @@ fn main() -> Result<()> {
 
 		parent: ROOT_INO,
 		entry_name: String::from("/"),
+		symlink: None,
+		hardlink: None,
+		hardlink_target: 0,
 	});
 
 	let mut counter: u64 = 2;
@@ -304,113 +341,114 @@ fn main() -> Result<()> {
 	};
 
 	let mut ino_from_dir: HashMap<String, u64> = HashMap::new();
+	let mut ino_from_entry_name: HashMap<String, u64> = HashMap::new();
+	let mut hardlinks: Vec<u64> = Vec::new();
 
-	loop {
-		match a.read_next_header(&mut entry) {
-			Ok(()) => {
-				let entry_name = entry.pathname();
-				let mut full_name = String::from(&entry_name);
+	while let Ok(_) = a.read_next_header(&mut entry) {
+		let entry_name = entry.pathname().unwrap_or(String::from(""));
+		let full_name = String::from(RelativePath::new(&entry_name).normalize().to_string().trim_start_matches("../"));
 
-				if full_name.starts_with("./") {
-					full_name = String::from(&full_name[2..])
-				}
+		if full_name.is_empty() {
+			continue;
+		}
 
-				if full_name.starts_with("/") {
-					full_name = String::from(&full_name[1..])
-				}
+		let st = entry.stat();
+		let typ = match st.st_mode & archive::AE_IFMT {
+			archive::AE_IFREG => libc::DT_REG,
+			archive::AE_IFLNK => libc::DT_LNK,
+			archive::AE_IFSOCK => libc::DT_SOCK,
+			archive::AE_IFCHR => libc::DT_CHR,
+			archive::AE_IFBLK => libc::DT_BLK,
+			archive::AE_IFDIR => libc::DT_DIR,
+			archive::AE_IFIFO => libc::DT_FIFO,
+			_ => libc::DT_UNKNOWN,
+		};
 
-				if full_name.ends_with("/") {
-					full_name = String::from(&full_name[..full_name.len()-1])
-				}
+		let name: &str;
+		let parent: u64;
+		if let Some(pos) = full_name.rfind('/') {
+			let (parent_name, basename) = full_name.split_at(pos);
 
-				if full_name.is_empty() {
-					continue;
-				}
+			name = &basename[1..];
 
-				let st = entry.stat();
-				let typ = match st.st_mode & archive::AE_IFMT {
-					archive::AE_IFREG => libc::DT_REG,
-					archive::AE_IFLNK => libc::DT_LNK,
-					archive::AE_IFSOCK => libc::DT_SOCK,
-					archive::AE_IFCHR => libc::DT_CHR,
-					archive::AE_IFBLK => libc::DT_BLK,
-					archive::AE_IFDIR => libc::DT_DIR,
-					archive::AE_IFIFO => libc::DT_FIFO,
-					_ => libc::DT_REG,
-				};
+			if let Some(&parent_ino) = ino_from_dir.get(parent_name) {
+				parent = parent_ino;
+			} else {
+				ino_from_dir.insert(String::from(parent_name), counter);
+				parent = counter;
+				counter += 1;
+			}
+		} else {
+			name = &full_name;
+			parent = ROOT_INO;
+		}
 
-				let name: &str;
-				let parent: u64;
-				if let Some(pos) = full_name.rfind('/') {
-					let (parent_name, basename) = full_name.split_at(pos);
+		let ino: u64;
+		if typ == libc::DT_DIR {
+			if ino_from_dir.contains_key(&full_name) {
+				ino = ino_from_dir[&full_name];
+			} else {
+				ino_from_dir.insert(String::from(&full_name), counter);
+				ino = counter;
+				counter += 1;
+			}
+		} else {
+			ino = counter;
+			counter += 1;
+		}
 
-					name = &basename[1..];
+		let dir_contents = fs.directories.entry(parent).or_insert(DirContents::new());
+		dir_contents.children.push(ino);
+		dir_contents.ino_from_name.insert(String::from(name), ino);
 
-					if let Some(&parent_ino) = ino_from_dir.get(parent_name) {
-						parent = parent_ino;
-					} else {
-						ino_from_dir.insert(String::from(parent_name), counter);
-						parent = counter;
-						counter += 1;
-					}
+		ino_from_entry_name.insert(String::from(&entry_name), ino);
+
+		let attr = DirEntry {
+			name: String::from(name),
+			ino: ino,
+			typ: typ as u32,
+
+			size: st.st_size as u64,
+			blksize: 512,
+			blocks: ((st.st_size + 511) / 512) as u64,
+			atime: Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
+			mtime: Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
+			ctime: Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
+			mode: st.st_mode,
+			nlink: {
+				if (typ == libc::DT_DIR) && (st.st_nlink < 2) {
+					2
+				} else if st.st_nlink < 1 {
+					1
 				} else {
-					name = &full_name;
-					parent = ROOT_INO;
+					st.st_nlink as u32
 				}
-
-				let ino: u64;
-				if typ == libc::DT_DIR {
-					if ino_from_dir.contains_key(&full_name) {
-						ino = ino_from_dir[&full_name];
-					} else {
-						ino_from_dir.insert(String::from(&full_name), counter);
-						ino = counter;
-						counter += 1;
-					}
-				} else {
-					ino = counter;
-					counter += 1;
-				}
-
-				let dir_contents = fs.directories.entry(parent).or_insert(DirContents::new());
-				dir_contents.children.push(ino);
-				dir_contents.ino_from_name.insert(String::from(name), ino);
-
-				let attr = DirEntry {
-					name: String::from(name),
-					ino: ino,
-					typ: typ as u32,
-
-					size: st.st_size as u64,
-					blksize: 512,
-					blocks: ((st.st_size + 511) / 512) as u64,
-					atime: Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
-					mtime: Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
-					ctime: Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
-					mode: st.st_mode,
-					nlink: {
-						if (typ == libc::DT_DIR) && (st.st_nlink < 2) {
-							2
-						} else if st.st_nlink < 1 {
-							1
-						} else {
-							st.st_nlink as u32
-						}
-					},
-					uid: st.st_uid,
-					gid: st.st_gid,
-					rdev: st.st_rdev as u32,
-
-					parent: parent,
-					entry_name: entry_name,
-				};
-
-				println!("{:?}", attr);
-				fs.inodes.insert(ino, attr);
 			},
-			Err(e) => {
-				println!("{:?}", e);
-				break;
+			uid: st.st_uid,
+			gid: st.st_gid,
+			rdev: st.st_rdev as u32,
+
+			parent: parent,
+			entry_name: entry_name,
+			symlink: entry.symlink(),
+			hardlink: entry.hardlink(),
+			hardlink_target: 0,
+		};
+
+		if attr.hardlink.is_some() {
+			hardlinks.push(ino);
+		}
+
+		println!("{:?}", attr);
+		fs.inodes.insert(ino, attr);
+	}
+
+	for ino in hardlinks {
+		if let Some(entry) = fs.inodes.get_mut(&ino) {
+			if let Some(hardlink) = &entry.hardlink {
+				if let Some(&target_ino) = ino_from_entry_name.get(hardlink) {
+					entry.hardlink_target = target_ino;
+				}
 			}
 		}
 	}
@@ -443,6 +481,7 @@ fn main() -> Result<()> {
 		match req.operation()? {
 			Operation::Lookup(op) => fs.lookup(&req, op)?,
 			Operation::Getattr(op) => fs.getattr(&req, op)?,
+			Operation::Readlink(op) => fs.readlink(&req, op)?,
 			Operation::Read(op) => fs.read(&req, op)?,
 			Operation::Readdir(op) => fs.readdir(&req, op)?,
 			Operation::Statfs(op) => fs.statfs(&req, op)?,
