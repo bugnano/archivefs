@@ -25,7 +25,7 @@ use std::{io, path::PathBuf, time::Duration};
 use clap::{Arg, App, crate_version};
 use std::os::unix::io::AsRawFd;
 use termios::{Termios, tcsetattr, ECHO, TCSANOW};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use relative_path::RelativePath;
 
@@ -59,8 +59,6 @@ struct DirEntry {
 	parent: u64,
 	entry_name: String,
 	symlink: Option<String>,
-	hardlink: Option<String>,
-	hardlink_target: u64,
 }
 
 impl DirEntry {
@@ -104,20 +102,6 @@ struct ArchiveFS {
 }
 
 impl ArchiveFS {
-	fn hardlink_ino(&self, ino: u64) -> u64 {
-		if !self.inodes.contains_key(&ino) {
-			return ino;
-		}
-
-		let mut target_ino = ino;
-
-		while self.inodes[&target_ino].hardlink_target != 0 {
-			target_ino = self.inodes[&target_ino].hardlink_target;
-		}
-
-		target_ino
-	}
-
 	fn lookup(&self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
 		let parent = op.parent();
 
@@ -125,10 +109,8 @@ impl ArchiveFS {
 			if let Some(&ino) = self.directories[&parent].ino_from_name.get(&op.name().to_string_lossy().into_owned()) {
 				let mut out = EntryOut::default();
 
-				let target_ino = self.hardlink_ino(ino);
-
-				self.inodes[&target_ino].fill_attr(out.attr());
-				out.ino(target_ino);
+				self.inodes[&ino].fill_attr(out.attr());
+				out.ino(ino);
 				out.ttl_attr(TTL);
 				out.ttl_entry(TTL);
 
@@ -144,7 +126,7 @@ impl ArchiveFS {
 	fn getattr(&self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
 		let mut out = AttrOut::default();
 
-		if let Some(entry) = self.inodes.get(&self.hardlink_ino(op.ino())) {
+		if let Some(entry) = self.inodes.get(&op.ino()) {
 			entry.fill_attr(out.attr());
 			out.ttl(TTL);
 
@@ -155,7 +137,7 @@ impl ArchiveFS {
 	}
 
 	fn readlink(&self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
-		if let Some(entry) = self.inodes.get(&self.hardlink_ino(op.ino())) {
+		if let Some(entry) = self.inodes.get(&op.ino()) {
 			if let Some(symlink) = &entry.symlink {
 				req.reply(&symlink)
 			} else {
@@ -186,7 +168,7 @@ impl ArchiveFS {
 	}
 
 	fn readdir(&self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
-		let ino = self.hardlink_ino(op.ino());
+		let ino = op.ino();
 		let offset = op.offset();
 
 		if !self.directories.contains_key(&ino) {
@@ -207,7 +189,7 @@ impl ArchiveFS {
 		}
 
 		if offset < 2 {
-			entry = &self.inodes[&self.hardlink_ino(entry.parent)];
+			entry = &self.inodes[&entry.parent];
 
 			out.entry(
 				OsStr::new(".."),
@@ -218,11 +200,10 @@ impl ArchiveFS {
 		}
 
 		for (i, &child_ino) in self.directories[&ino].children.iter().enumerate().skip(offset.saturating_sub(2) as usize) {
-			entry = &self.inodes[&self.hardlink_ino(child_ino)];
-			let real_entry = &self.inodes[&child_ino];
+			entry = &self.inodes[&child_ino];
 
 			let full = out.entry(
-				OsStr::new(&real_entry.name),
+				OsStr::new(&entry.name),
 				entry.ino,
 				entry.typ,
 				(i + 3) as u64,
@@ -251,6 +232,220 @@ impl ArchiveFS {
 
 		req.reply(out)
 	}
+}
+
+fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
+	// Inode number 1 is the root directory
+	fs.inodes.insert(ROOT_INO, DirEntry {
+		name: String::from(""),
+		ino: ROOT_INO,
+		typ: libc::DT_DIR as u32,
+
+		size: 0,
+		blksize: 512,
+		blocks: 0,
+		atime: Duration::new(0, 0),
+		mtime: Duration::new(0, 0),
+		ctime: Duration::new(0, 0),
+		mode: libc::S_IFDIR | 0o555,
+		nlink: 2,
+		uid: unsafe { libc::getuid() },
+		gid: unsafe { libc::getgid() },
+		rdev: 0,
+
+		parent: ROOT_INO,
+		entry_name: String::from("/"),
+		symlink: None,
+	});
+
+	// File inode numbers start from 2
+	let mut counter: u64 = 2;
+
+	let mut entry = ArchiveEntry::new();
+	let a = match Archive::read_open_filename(&fs.archive_path, 10240, fs.password.as_deref()) {
+		Ok(a) => a,
+		Err(ArchiveError::Eof) => bail!("EOF"),
+		Err(ArchiveError::Retry(s)) => bail!("{}", s),
+		Err(ArchiveError::Warn(s)) => bail!("{}", s),
+		Err(ArchiveError::Failed(s)) => bail!("{}", s),
+		Err(ArchiveError::Fatal(s)) => bail!("{}", s),
+		Err(ArchiveError::Unknown(_, s)) => bail!("{}", s),
+	};
+
+	// Some temporary data structures to speed up file name/inode lookup
+	#[derive(Debug)]
+	struct HardLink {
+		entry_name: String,
+		target: u64,
+	}
+
+	let mut ino_from_dir: HashMap<String, u64> = HashMap::new();
+	let mut ino_from_entry_name: HashMap<String, u64> = HashMap::new();
+	let mut hardlinks: HashMap<u64, HardLink> = HashMap::new();
+
+	while let Ok(_) = a.read_next_header(&mut entry) {
+		let entry_name = entry.pathname().unwrap_or(String::from(""));
+		let full_name = String::from(RelativePath::new(&entry_name).normalize().to_string().trim_start_matches("../"));
+
+		// full_name can be empty if it refers to the root directory
+		if full_name.is_empty() {
+			continue;
+		}
+
+		let st = entry.stat();
+		let typ = match st.st_mode & archive::AE_IFMT {
+			archive::AE_IFREG => libc::DT_REG,
+			archive::AE_IFLNK => libc::DT_LNK,
+			archive::AE_IFSOCK => libc::DT_SOCK,
+			archive::AE_IFCHR => libc::DT_CHR,
+			archive::AE_IFBLK => libc::DT_BLK,
+			archive::AE_IFDIR => libc::DT_DIR,
+			archive::AE_IFIFO => libc::DT_FIFO,
+			_ => libc::DT_UNKNOWN,
+		};
+
+		// Get directory and file name
+		let name: &str;
+		let parent: u64;
+		if let Some(pos) = full_name.rfind('/') {
+			let (parent_name, basename) = full_name.split_at(pos);
+
+			name = &basename[1..];
+
+			if let Some(&parent_ino) = ino_from_dir.get(parent_name) {
+				parent = parent_ino;
+			} else {
+				// This file refers to a directory that has not yet been listed in the archive
+				// Create the entry and hope that it will appear in a later read_next_header call
+				ino_from_dir.insert(String::from(parent_name), counter);
+				parent = counter;
+				counter += 1;
+			}
+		} else {
+			name = &full_name;
+			parent = ROOT_INO;
+		}
+
+		let ino: u64;
+		if typ == libc::DT_DIR {
+			if ino_from_dir.contains_key(&full_name) {
+				// This directory has already been referenced previously by a file
+				ino = ino_from_dir[&full_name];
+			} else {
+				ino_from_dir.insert(String::from(&full_name), counter);
+				ino = counter;
+				counter += 1;
+			}
+		} else {
+			ino = counter;
+			counter += 1;
+		}
+
+		let dir_contents = fs.directories.entry(parent).or_insert(DirContents::new());
+		dir_contents.children.push(ino);
+		dir_contents.ino_from_name.insert(String::from(name), ino);
+
+		ino_from_entry_name.insert(String::from(&entry_name), ino);
+
+		let attr = DirEntry {
+			name: String::from(name),
+			ino: ino,
+			typ: typ as u32,
+
+			size: st.st_size as u64,
+			blksize: 512,
+			blocks: ((st.st_size + 511) / 512) as u64,
+			atime: Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
+			mtime: Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
+			ctime: Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
+			mode: st.st_mode,
+			nlink: {
+				if (typ == libc::DT_DIR) && (st.st_nlink < 2) {
+					2
+				} else if st.st_nlink < 1 {
+					1
+				} else {
+					st.st_nlink as u32
+				}
+			},
+			uid: st.st_uid,
+			gid: st.st_gid,
+			rdev: st.st_rdev as u32,
+
+			parent: parent,
+			entry_name: entry_name,
+			symlink: entry.symlink(),
+		};
+
+		// Hardlinks don't have a correct stat(), so they have to be processed later
+		if let Some(hardlink) = entry.hardlink() {
+			hardlinks.insert(ino, HardLink {
+				entry_name: hardlink,
+				target: ino,
+			});
+		}
+
+		println!("{:?}", attr);
+		fs.inodes.insert(ino, attr);
+	}
+
+	// Step 1: Get the target inode number for hard links
+	println!("Hardlinks");
+	for (_ino, hardlink) in hardlinks.iter_mut() {
+		if let Some(&target_ino) = ino_from_entry_name.get(&hardlink.entry_name) {
+			hardlink.target = target_ino;
+		}
+	}
+
+	// Step 2: Recurse into the target inode until we find a real file
+	for (&ino, hardlink) in hardlinks.iter() {
+		let mut target_ino = hardlink.target;
+
+		// Maintain a set of visited targets to prevent infinite loops
+		let mut visited_targets: HashSet<u64> = HashSet::new();
+		visited_targets.insert(ino);
+		while hardlinks.contains_key(&target_ino) && (!visited_targets.contains(&hardlinks[&target_ino].target))  {
+			target_ino = hardlinks[&target_ino].target;
+			visited_targets.insert(target_ino);
+		}
+
+		let entry = &fs.inodes[&ino];
+		let target_entry = &fs.inodes[&target_ino];
+
+		// Create a new entry to replace the hard link
+		let attr = DirEntry {
+			name: String::from(&entry.name),
+			ino: ino,
+			typ: target_entry.typ,
+
+			size: target_entry.size,
+			blksize: target_entry.blksize,
+			blocks: target_entry.blocks,
+			atime: target_entry.atime,
+			mtime: target_entry.mtime,
+			ctime: target_entry.ctime,
+			mode: target_entry.mode,
+			nlink: target_entry.nlink,
+			uid: target_entry.uid,
+			gid: target_entry.gid,
+			rdev: target_entry.rdev,
+
+			parent: entry.parent,
+			entry_name: String::from(&target_entry.entry_name),
+			symlink: match &target_entry.symlink {
+				Some(symlink) => Some(String::from(symlink)),
+				None => None,
+			},
+		};
+
+		println!("{:?}", attr);
+		fs.inodes.insert(ino, attr);
+	}
+
+	println!("fs.directories: {:?}", fs.directories);
+	println!("ino_from_dir: {:?}", ino_from_dir);
+
+	Ok(())
 }
 
 fn main() -> Result<()> {
@@ -304,157 +499,7 @@ fn main() -> Result<()> {
 		directories: HashMap::new(),
 	};
 
-	fs.inodes.insert(ROOT_INO, DirEntry {
-		name: String::from(""),
-		ino: ROOT_INO,
-		typ: libc::DT_DIR as u32,
-
-		size: 0,
-		blksize: 512,
-		blocks: 0,
-		atime: Duration::new(0, 0),
-		mtime: Duration::new(0, 0),
-		ctime: Duration::new(0, 0),
-		mode: libc::S_IFDIR | 0o555,
-		nlink: 2,
-		uid: unsafe { libc::getuid() },
-		gid: unsafe { libc::getgid() },
-		rdev: 0,
-
-		parent: ROOT_INO,
-		entry_name: String::from("/"),
-		symlink: None,
-		hardlink: None,
-		hardlink_target: 0,
-	});
-
-	let mut counter: u64 = 2;
-	let mut entry = ArchiveEntry::new();
-	let a = match Archive::read_open_filename(&fs.archive_path, 10240, fs.password.as_deref()) {
-		Ok(a) => a,
-		Err(ArchiveError::Eof) => bail!("EOF"),
-		Err(ArchiveError::Retry(s)) => bail!("{}", s),
-		Err(ArchiveError::Warn(s)) => bail!("{}", s),
-		Err(ArchiveError::Failed(s)) => bail!("{}", s),
-		Err(ArchiveError::Fatal(s)) => bail!("{}", s),
-		Err(ArchiveError::Unknown(_, s)) => bail!("{}", s),
-	};
-
-	let mut ino_from_dir: HashMap<String, u64> = HashMap::new();
-	let mut ino_from_entry_name: HashMap<String, u64> = HashMap::new();
-	let mut hardlinks: Vec<u64> = Vec::new();
-
-	while let Ok(_) = a.read_next_header(&mut entry) {
-		let entry_name = entry.pathname().unwrap_or(String::from(""));
-		let full_name = String::from(RelativePath::new(&entry_name).normalize().to_string().trim_start_matches("../"));
-
-		if full_name.is_empty() {
-			continue;
-		}
-
-		let st = entry.stat();
-		let typ = match st.st_mode & archive::AE_IFMT {
-			archive::AE_IFREG => libc::DT_REG,
-			archive::AE_IFLNK => libc::DT_LNK,
-			archive::AE_IFSOCK => libc::DT_SOCK,
-			archive::AE_IFCHR => libc::DT_CHR,
-			archive::AE_IFBLK => libc::DT_BLK,
-			archive::AE_IFDIR => libc::DT_DIR,
-			archive::AE_IFIFO => libc::DT_FIFO,
-			_ => libc::DT_UNKNOWN,
-		};
-
-		let name: &str;
-		let parent: u64;
-		if let Some(pos) = full_name.rfind('/') {
-			let (parent_name, basename) = full_name.split_at(pos);
-
-			name = &basename[1..];
-
-			if let Some(&parent_ino) = ino_from_dir.get(parent_name) {
-				parent = parent_ino;
-			} else {
-				ino_from_dir.insert(String::from(parent_name), counter);
-				parent = counter;
-				counter += 1;
-			}
-		} else {
-			name = &full_name;
-			parent = ROOT_INO;
-		}
-
-		let ino: u64;
-		if typ == libc::DT_DIR {
-			if ino_from_dir.contains_key(&full_name) {
-				ino = ino_from_dir[&full_name];
-			} else {
-				ino_from_dir.insert(String::from(&full_name), counter);
-				ino = counter;
-				counter += 1;
-			}
-		} else {
-			ino = counter;
-			counter += 1;
-		}
-
-		let dir_contents = fs.directories.entry(parent).or_insert(DirContents::new());
-		dir_contents.children.push(ino);
-		dir_contents.ino_from_name.insert(String::from(name), ino);
-
-		ino_from_entry_name.insert(String::from(&entry_name), ino);
-
-		let attr = DirEntry {
-			name: String::from(name),
-			ino: ino,
-			typ: typ as u32,
-
-			size: st.st_size as u64,
-			blksize: 512,
-			blocks: ((st.st_size + 511) / 512) as u64,
-			atime: Duration::new(st.st_atime as u64, st.st_atime_nsec as u32),
-			mtime: Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32),
-			ctime: Duration::new(st.st_ctime as u64, st.st_ctime_nsec as u32),
-			mode: st.st_mode,
-			nlink: {
-				if (typ == libc::DT_DIR) && (st.st_nlink < 2) {
-					2
-				} else if st.st_nlink < 1 {
-					1
-				} else {
-					st.st_nlink as u32
-				}
-			},
-			uid: st.st_uid,
-			gid: st.st_gid,
-			rdev: st.st_rdev as u32,
-
-			parent: parent,
-			entry_name: entry_name,
-			symlink: entry.symlink(),
-			hardlink: entry.hardlink(),
-			hardlink_target: 0,
-		};
-
-		if attr.hardlink.is_some() {
-			hardlinks.push(ino);
-		}
-
-		println!("{:?}", attr);
-		fs.inodes.insert(ino, attr);
-	}
-
-	for ino in hardlinks {
-		if let Some(entry) = fs.inodes.get_mut(&ino) {
-			if let Some(hardlink) = &entry.hardlink {
-				if let Some(&target_ino) = ino_from_entry_name.get(hardlink) {
-					entry.hardlink_target = target_ino;
-				}
-			}
-		}
-	}
-
-	println!("fs.directories: {:?}", fs.directories);
-	println!("ino_from_dir: {:?}", ino_from_dir);
+	populate_filesystem(&mut fs)?;
 
 	let mountpoint = PathBuf::from(matches.value_of("MOUNTPOINT").unwrap());
     ensure!(mountpoint.is_dir(), "MOUNTPOINT must be a directory");
