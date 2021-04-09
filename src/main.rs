@@ -15,7 +15,7 @@
 
 use polyfuse::{
 	op,
-	reply::{AttrOut, EntryOut, FileAttr, ReaddirOut, StatfsOut},
+	reply::{AttrOut, EntryOut, FileAttr, OpenOut, ReaddirOut, StatfsOut},
 	KernelConfig, Operation, Request, Session,
 };
 
@@ -31,12 +31,12 @@ use relative_path::RelativePath;
 
 mod archive;
 
-use archive::{Archive, ArchiveEntry, ArchiveError};
+use archive::{Archive, ArchiveEntry};
 
 const TTL: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const ROOT_INO: u64 = 1;
-const HELLO_INO: u64 = 2;
-const HELLO_CONTENT: &[u8] = b"Hello, world!\n";
+
+const BLOCK_SIZE: usize = 10240;
 
 #[derive(Debug)]
 struct DirEntry {
@@ -94,11 +94,21 @@ impl DirContents {
 }
 
 #[derive(Debug)]
+struct OpenedArchive {
+	entry_name: String,
+	archive: Archive,
+	position: usize,
+}
+
+#[derive(Debug)]
 struct ArchiveFS {
 	archive_path: String,
 	password: Option<String>,
 	inodes: HashMap<u64, DirEntry>,
 	directories: HashMap<u64, DirContents>,
+	counter: u64,
+	opened_files: HashMap<u64, OpenedArchive>,
+	buf_discard: Vec<u8>,
 }
 
 impl ArchiveFS {
@@ -148,23 +158,127 @@ impl ArchiveFS {
 		}
 	}
 
-	fn read(&self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
-		match op.ino() {
-			HELLO_INO => (),
-			ROOT_INO => return req.reply_error(libc::EISDIR),
-			_ => return req.reply_error(libc::ENOENT),
+	fn open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
+		let ino = op.ino();
+
+		if ((op.flags() as i32) & libc::O_ACCMODE) != libc::O_RDONLY {
+			return req.reply_error(libc::EACCES);
+		} else if self.directories.contains_key(&ino) {
+			return req.reply_error(libc::EISDIR);
+		} else if !self.inodes.contains_key(&ino) {
+			return req.reply_error(libc::ENOENT);
+		} else {
+			let mut entry = ArchiveEntry::new();
+			let a = match Archive::read_open_filename(&self.archive_path, BLOCK_SIZE, self.password.as_deref()) {
+				Ok(a) => a,
+				Err(e) => return req.reply_error(e.errno),
+			};
+
+			let target_name = &self.inodes[&ino].entry_name;
+
+			while let Ok(_) = a.read_next_header(&mut entry) {
+				let entry_name = entry.pathname().unwrap_or(String::from(""));
+				if &entry_name == target_name {
+					let fh = self.counter;
+					self.counter += 1;
+
+					self.opened_files.insert(fh, OpenedArchive {
+						entry_name: String::from(target_name),
+						archive: a,
+						position: 0,
+					});
+
+					let mut out = OpenOut::default();
+
+					out.fh(fh);
+					out.keep_cache(true);
+
+					return req.reply(out);
+				}
+			}
+
+			req.reply_error(libc::ENOENT)
 		}
+	}
 
-		let mut data: &[u8] = &[];
-
-		let offset = op.offset() as usize;
-		if offset < HELLO_CONTENT.len() {
+	fn read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
+		if let Some(archive) = self.opened_files.get_mut(&op.fh()) {
+			let offset = op.offset() as usize;
 			let size = op.size() as usize;
-			data = &HELLO_CONTENT[offset..];
-			data = &data[..std::cmp::min(data.len(), size)];
-		}
 
-		req.reply(data)
+			if size == 0 {
+				return req.reply(&[]);
+			}
+
+			if offset < archive.position {
+				// The requested offset is lower than the current position:
+				// We have to close the current archive, open a new one and seek until the offset
+			} else if offset > archive.position {
+				// The requested offset is greater than the current position:
+				// Read and discard until we get to the correct offset
+				let mut bytes_remaining = offset - archive.position;
+
+				while bytes_remaining > self.buf_discard.len() {
+					match archive.archive.read_data(&mut self.buf_discard) {
+						Ok(bytes_read) => {
+							bytes_remaining -= bytes_read;
+							archive.position += bytes_read;
+
+							// If we read 0, then we reached the end of file
+							if bytes_read == 0 {
+								return req.reply(&[]);
+							}
+						},
+						Err(e) => return req.reply_error(e.errno),
+					}
+				}
+
+				while bytes_remaining > 0 {
+					match archive.archive.read_data(&mut self.buf_discard[..bytes_remaining]) {
+						Ok(bytes_read) => {
+							bytes_remaining -= bytes_read;
+							archive.position += bytes_read;
+
+							// If we read 0, then we reached the end of file
+							if bytes_read == 0 {
+								return req.reply(&[]);
+							}
+						},
+						Err(e) => return req.reply_error(e.errno),
+					}
+				}
+			} else {
+				// We already are at the correct position
+			}
+
+			let mut data: Vec<u8> = vec![0; size];
+			let mut total_bytes: usize = 0;
+
+			while total_bytes < size {
+				match archive.archive.read_data(&mut data[total_bytes..]) {
+					Ok(bytes_read) => {
+						total_bytes += bytes_read;
+						archive.position += bytes_read;
+
+						// If we read 0, then we reached the end of file
+						if bytes_read == 0 {
+							return req.reply(&data[..total_bytes]);
+						}
+					},
+					Err(e) => return req.reply_error(e.errno),
+				}
+			}
+
+			req.reply(data)
+		} else {
+			req.reply_error(libc::ENOENT)
+		}
+	}
+
+	fn release(&mut self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
+		let _file = self.opened_files.remove(&op.fh());
+
+		req.reply(())
 	}
 
 	fn readdir(&self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
@@ -262,14 +376,9 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 	let mut counter: u64 = 2;
 
 	let mut entry = ArchiveEntry::new();
-	let a = match Archive::read_open_filename(&fs.archive_path, 10240, fs.password.as_deref()) {
+	let a = match Archive::read_open_filename(&fs.archive_path, BLOCK_SIZE, fs.password.as_deref()) {
 		Ok(a) => a,
-		Err(ArchiveError::Eof) => bail!("EOF"),
-		Err(ArchiveError::Retry(s)) => bail!("{}", s),
-		Err(ArchiveError::Warn(s)) => bail!("{}", s),
-		Err(ArchiveError::Failed(s)) => bail!("{}", s),
-		Err(ArchiveError::Fatal(s)) => bail!("{}", s),
-		Err(ArchiveError::Unknown(_, s)) => bail!("{}", s),
+		Err(e) => bail!("{}", e.error_string),
 	};
 
 	// Some temporary data structures to speed up file name/inode lookup
@@ -283,12 +392,13 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 	let mut ino_from_entry_name: HashMap<String, u64> = HashMap::new();
 	let mut hardlinks: HashMap<u64, HardLink> = HashMap::new();
 
+	// Let's populate the filesystem
 	while let Ok(_) = a.read_next_header(&mut entry) {
 		let entry_name = entry.pathname().unwrap_or(String::from(""));
 		let full_name = String::from(RelativePath::new(&entry_name).normalize().to_string().trim_start_matches("../"));
 
 		// full_name can be empty if it refers to the root directory
-		if full_name.is_empty() {
+		if full_name.is_empty() || (full_name == "..") {
 			continue;
 		}
 
@@ -497,12 +607,15 @@ fn main() -> Result<()> {
 		},
 		inodes: HashMap::new(),
 		directories: HashMap::new(),
+		counter: 1,
+		opened_files: HashMap::new(),
+		buf_discard: vec![0; BLOCK_SIZE],
 	};
-
-	populate_filesystem(&mut fs)?;
 
 	let mountpoint = PathBuf::from(matches.value_of("MOUNTPOINT").unwrap());
     ensure!(mountpoint.is_dir(), "MOUNTPOINT must be a directory");
+
+	populate_filesystem(&mut fs)?;
 
 	let mut config = KernelConfig::default();
 	if let Some(o) = matches.values_of("o") {
@@ -513,21 +626,14 @@ fn main() -> Result<()> {
 
 	let session = Session::mount(mountpoint, config)?;
 
-	// Per feature parity con fuse-rs:
-	// init (nop)
-	// destroy (nop)
-	// forget (nop)
-	// open (opened(0, 0))
-	// release (ok)
-	// opendir (opened(0, 0))
-	// releasedir (ok)
-	// statfs
 	while let Some(req) = session.next_request()? {
 		match req.operation()? {
 			Operation::Lookup(op) => fs.lookup(&req, op)?,
 			Operation::Getattr(op) => fs.getattr(&req, op)?,
 			Operation::Readlink(op) => fs.readlink(&req, op)?,
+			Operation::Open(op) => fs.open(&req, op)?,
 			Operation::Read(op) => fs.read(&req, op)?,
+			Operation::Release(op) => fs.release(&req, op)?,
 			Operation::Readdir(op) => fs.readdir(&req, op)?,
 			Operation::Statfs(op) => fs.statfs(&req, op)?,
 			_ => req.reply_error(libc::ENOSYS)?,

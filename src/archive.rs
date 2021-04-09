@@ -13,8 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use libc::{c_int, c_char, size_t, stat, mode_t};
-use std::ffi::{CString, CStr};
+use libc::{c_char, c_int, c_void, mode_t, size_t, ssize_t, stat};
+use std::ffi::{CStr, CString};
 use std::error;
 use std::fmt;
 
@@ -46,6 +46,7 @@ extern {
 	fn archive_read_add_passphrase(archive: *mut s_archive, passphrase: *const c_char) -> c_int;
 	fn archive_read_open_filename(archive: *mut s_archive, filename: *const c_char, block_size: size_t) -> c_int;
 	fn archive_read_next_header2(archive: *mut s_archive, archive_entry: *mut s_archive_entry) -> c_int;
+	fn archive_read_data(archive: *mut s_archive, buff: *mut c_void, len: size_t) -> ssize_t;
 
 	fn archive_entry_new() -> *mut s_archive_entry;
 	fn archive_entry_free(archive_entry: *mut s_archive_entry);
@@ -54,29 +55,28 @@ extern {
 	fn archive_entry_symlink(a: *mut s_archive_entry) -> *const c_char;
 	fn archive_entry_hardlink(a: *mut s_archive_entry) -> *const c_char;
 
+	fn archive_errno(archive: *mut s_archive) -> c_int;
 	fn archive_error_string(archive: *mut s_archive) -> *const c_char;
 }
 
 #[derive(Debug, Clone)]
-pub enum ArchiveError {
-	Eof,
-	Retry(String),
-	Warn(String),
-	Failed(String),
-	Fatal(String),
-	Unknown(c_int, String),
+pub struct ArchiveError {
+	pub error_code: c_int,
+	pub errno: c_int,
+	pub error_string: String,
 }
 
 impl fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		match self {
-			ArchiveError::Eof => write!(f, "ArchiveError::Eof"),
-			ArchiveError::Retry(s) => write!(f, "ArchiveError::Retry({})", s),
-			ArchiveError::Warn(s) => write!(f, "ArchiveError::Warn({})", s),
-			ArchiveError::Failed(s) => write!(f, "ArchiveError::Failed({})", s),
-			ArchiveError::Fatal(s) => write!(f, "ArchiveError::Fatal({})", s),
-			ArchiveError::Unknown(n, s) => write!(f, "ArchiveError::Unknown({}, {})", n, s),
-		}
+		write!(f, "(ArchiveError::{}): {} ({})", match self.error_code {
+			ARCHIVE_EOF => "Eof",
+			ARCHIVE_OK => "Ok",
+			ARCHIVE_RETRY => "Retry",
+			ARCHIVE_WARN => "Warn",
+			ARCHIVE_FAILED => "Failed",
+			ARCHIVE_FATAL => "Fatal",
+			_ => "Unknown",
+		}, self.error_string, self.errno)
     }
 }
 
@@ -90,16 +90,11 @@ unsafe fn string_from_pointer(p: *const c_char) -> Option<String> {
 	}
 }
 
-fn archive_error_from_int(i: c_int, a: &Archive) -> ArchiveError {
-	let s = unsafe { string_from_pointer(archive_error_string(a.archive)).unwrap_or(String::from("")) };
-
-	match i {
-		ARCHIVE_EOF => ArchiveError::Eof,
-		ARCHIVE_RETRY => ArchiveError::Retry(s),
-		ARCHIVE_WARN => ArchiveError::Warn(s),
-		ARCHIVE_FAILED => ArchiveError::Failed(s),
-		ARCHIVE_FATAL => ArchiveError::Fatal(s),
-		_ => ArchiveError::Unknown(i, s),
+fn archive_error_from_error_code(error_code: c_int, a: &Archive) -> ArchiveError {
+	ArchiveError {
+		error_code: error_code,
+		errno: unsafe { archive_errno(a.archive) },
+		error_string: unsafe { string_from_pointer(archive_error_string(a.archive)).unwrap_or(String::from("")) },
 	}
 }
 
@@ -116,26 +111,26 @@ impl Archive {
 
 		let mut r = unsafe { archive_read_support_filter_all(a.archive) };
 		if r != ARCHIVE_OK {
-			return Err(archive_error_from_int(r, &a).into());
+			return Err(archive_error_from_error_code(r, &a).into());
 		}
 
 		r = unsafe { archive_read_support_format_all(a.archive) };
 		if r != ARCHIVE_OK {
-			return Err(archive_error_from_int(r, &a).into());
+			return Err(archive_error_from_error_code(r, &a).into());
 		}
 
 		if let Some(phrase) = passphrase {
 			let p = CString::new(phrase).unwrap();
 			r = unsafe { archive_read_add_passphrase(a.archive, p.as_ptr()) };
 			if r != ARCHIVE_OK {
-				return Err(archive_error_from_int(r, &a).into());
+				return Err(archive_error_from_error_code(r, &a).into());
 			}
 		}
 
 		let f = CString::new(filename).unwrap();
 		r = unsafe { archive_read_open_filename(a.archive, f.as_ptr(), block_size) };
 		if r != ARCHIVE_OK {
-			return Err(archive_error_from_int(r, &a).into());
+			return Err(archive_error_from_error_code(r, &a).into());
 		}
 
 		Ok(a)
@@ -144,9 +139,18 @@ impl Archive {
 	pub fn read_next_header(&self, entry: &mut ArchiveEntry) -> Result<(), ArchiveError> {
 		let r = unsafe { archive_read_next_header2(self.archive, entry.archive_entry) };
 		if r != ARCHIVE_OK {
-			Err(archive_error_from_int(r, &self).into())
+			Err(archive_error_from_error_code(r, &self).into())
 		} else {
 			Ok(())
+		}
+	}
+
+	pub fn read_data(&self, buff: &mut [u8]) -> Result<usize, ArchiveError> {
+		let r = unsafe { archive_read_data(self.archive, buff.as_mut_ptr() as *mut c_void, buff.len()) };
+		if r < 0 {
+			Err(archive_error_from_error_code(r as c_int, &self).into())
+		} else {
+			Ok(r as usize)
 		}
 	}
 }
