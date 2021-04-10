@@ -213,7 +213,30 @@ impl ArchiveFS {
 			if offset < archive.position {
 				// The requested offset is lower than the current position:
 				// We have to close the current archive, open a new one and seek until the offset
-			} else if offset > archive.position {
+				let mut entry = ArchiveEntry::new();
+				let a = match Archive::read_open_filename(&self.archive_path, BLOCK_SIZE, self.password.as_deref()) {
+					Ok(a) => a,
+					Err(e) => return req.reply_error(e.errno),
+				};
+
+				let mut found = false;
+				while let Ok(_) = a.read_next_header(&mut entry) {
+					let entry_name = entry.pathname().unwrap_or(String::from(""));
+					if entry_name == archive.entry_name {
+						found = true;
+
+						archive.archive = a;
+						archive.position = 0;
+						break;
+					}
+				}
+
+				if !found {
+					return req.reply_error(libc::ENOENT);
+				}
+			}
+
+			if offset > archive.position {
 				// The requested offset is greater than the current position:
 				// Read and discard until we get to the correct offset
 				let mut bytes_remaining = offset - archive.position;
@@ -247,8 +270,6 @@ impl ArchiveFS {
 						Err(e) => return req.reply_error(e.errno),
 					}
 				}
-			} else {
-				// We already are at the correct position
 			}
 
 			let mut data: Vec<u8> = vec![0; size];
