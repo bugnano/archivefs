@@ -20,7 +20,7 @@ inspired by archivemount.
 
 ### For compiling
 
-* A Rust 1.31 or greater
+* Rust 1.31 or greater
 * Development files for libarchive (usually provided by the `libarchive-dev`
   or `libarchive-devel` package)
 

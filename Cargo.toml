@@ -3,6 +3,18 @@ name = "archivefs"
 version = "0.1.0"
 authors = ["Franco Bugnano <franco@bugnano.it>"]
 edition = "2018"
+license = "GPL-3.0-or-later"
+description = "A read-only FUSE filesystem for mounting compressed archives, inspired by archivemount."
+homepage = "https://github.com/bugnano/archivefs"
+repository = "https://github.com/bugnano/archivefs"
+readme = "README.md"
+keywords = ["libarchive", "zip", "7z", "tar", "mount"]
+categories = ["command-line-utilities", "compression", "filesystem"]
+include = [
+	"**/*.rs",
+	"Cargo.toml",
+	"Cargo.lock",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
