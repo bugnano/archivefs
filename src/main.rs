@@ -19,10 +19,10 @@ use polyfuse::{
 	KernelConfig, Operation, Request, Session,
 };
 
-use anyhow::{ensure, Result, bail};
+use anyhow::{bail, ensure, Result};
 use std::{io, path::PathBuf, time::Duration};
 
-use clap::{Arg, App, crate_version};
+use clap::{Arg, App, crate_name, crate_version};
 use std::os::unix::io::AsRawFd;
 use termios::{Termios, tcsetattr, ECHO, TCSANOW};
 use std::collections::{HashMap, HashSet};
@@ -580,7 +580,7 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 }
 
 fn main() -> Result<()> {
-	let matches = App::new("archivemount-rs")
+	let matches = App::new(crate_name!())
 		.version(crate_version!())
 		.author("Franco Bugnano")
 		.about("Mount an archive file as a read-only file system")
