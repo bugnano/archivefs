@@ -27,7 +27,7 @@ inspired by archivemount.
 ## Installation
 
 ```bash
-cargo build
+cargo install archivefs
 ```
 
 ## Usage

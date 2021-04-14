@@ -28,6 +28,9 @@ use termios::{Termios, tcsetattr, ECHO, TCSANOW};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use relative_path::RelativePath;
+use log::{LevelFilter, debug};
+use env_logger::{Builder, WriteStyle};
+use daemonize::Daemonize;
 
 mod archive;
 
@@ -516,12 +519,12 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 			});
 		}
 
-		println!("{:?}", attr);
+		debug!("{:?}", attr);
 		fs.inodes.insert(ino, attr);
 	}
 
 	// Step 1: Get the target inode number for hard links
-	println!("Hardlinks");
+	debug!("Hardlinks");
 	for (_ino, hardlink) in hardlinks.iter_mut() {
 		if let Some(&target_ino) = ino_from_entry_name.get(&hardlink.entry_name) {
 			hardlink.target = target_ino;
@@ -569,12 +572,12 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 			},
 		};
 
-		println!("{:?}", attr);
+		debug!("{:?}", attr);
 		fs.inodes.insert(ino, attr);
 	}
 
-	println!("fs.directories: {:?}", fs.directories);
-	println!("ino_from_dir: {:?}", ino_from_dir);
+	debug!("fs.directories: {:?}", fs.directories);
+	debug!("ino_from_dir: {:?}", ino_from_dir);
 
 	Ok(())
 }
@@ -596,6 +599,14 @@ fn main() -> Result<()> {
 			.short("p")
 			.long("password")
 			.help("Open a password encrypted archive"))
+		.arg(Arg::with_name("foreground")
+			.short("f")
+			.long("foreground")
+			.help("Foreground operation"))
+		.arg(Arg::with_name("debug")
+			.short("d")
+			.long("debug")
+			.help("Enable debug output (implies -f)"))
 		.arg(Arg::with_name("o")
 			.short("o")
 			.multiple(true)
@@ -604,6 +615,18 @@ fn main() -> Result<()> {
 			.value_name("OPTION")
 			.help("FUSE mount option"))
 		.get_matches();
+
+	// Configure logging as soon as possible
+	Builder::new()
+		.filter(None, {
+			if matches.is_present("debug") {
+				LevelFilter::Trace
+			} else {
+				LevelFilter::Off
+			}
+		})
+		.write_style(WriteStyle::Auto)
+		.init();
 
 	let mut fs = ArchiveFS {
 		archive_path: String::from(matches.value_of("ARCHIVEPATH").unwrap()),
@@ -646,6 +669,13 @@ fn main() -> Result<()> {
 	}
 
 	let session = Session::mount(mountpoint, config)?;
+
+	// Run as a daemon unless foreground operation or debug output is requested
+	if !(matches.is_present("foreground") || matches.is_present("debug")) {
+		Daemonize::new()
+			.working_directory(std::env::current_dir()?)
+			.start()?;
+	}
 
 	while let Some(req) = session.next_request()? {
 		match req.operation()? {
