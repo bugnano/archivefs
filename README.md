@@ -27,7 +27,13 @@ inspired by archivemount.
 ## Installation
 
 ```bash
+# This will install only the archivefs executable in $HOME/.cargo/bin, without any
+# man page. Also, make sure that the $HOME/.cargo/bin directory is in your PATH
 cargo install archivefs
+
+# Alternatively, you can build from source using the command
+cargo build --release
+# and then copy the file target/release/archivefs somewhere in your PATH
 ```
 
 ## Usage

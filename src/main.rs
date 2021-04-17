@@ -28,8 +28,9 @@ use termios::{Termios, tcsetattr, ECHO, TCSANOW};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use relative_path::RelativePath;
-use log::{LevelFilter, debug};
+use log::{LevelFilter, debug, trace};
 use env_logger::{Builder, WriteStyle};
+use std::io::Write;
 use daemonize::Daemonize;
 
 mod archive;
@@ -116,10 +117,16 @@ struct ArchiveFS {
 
 impl ArchiveFS {
 	fn lookup(&self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
+		trace!("lookup()");
+
 		let parent = op.parent();
+		let name = op.name().to_string_lossy().into_owned();
+
+		trace!("parent = {}", parent);
+		trace!("name = {}", name);
 
 		if self.directories.contains_key(&parent) {
-			if let Some(&ino) = self.directories[&parent].ino_from_name.get(&op.name().to_string_lossy().into_owned()) {
+			if let Some(&ino) = self.directories[&parent].ino_from_name.get(&name) {
 				let mut out = EntryOut::default();
 
 				self.inodes[&ino].fill_attr(out.attr());
@@ -127,54 +134,84 @@ impl ArchiveFS {
 				out.ttl_attr(TTL);
 				out.ttl_entry(TTL);
 
+				trace!("OK");
 				req.reply(out)
 			} else {
+				trace!("ENOENT: name not in directory");
 				req.reply_error(libc::ENOENT)
 			}
 		} else {
+			trace!("ENOENT: parent not in self.directories");
 			req.reply_error(libc::ENOENT)
 		}
 	}
 
 	fn getattr(&self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
+		trace!("getattr()");
+
+		let ino = op.ino();
+
+		trace!("ino = {}", ino);
+
 		let mut out = AttrOut::default();
 
-		if let Some(entry) = self.inodes.get(&op.ino()) {
+		if let Some(entry) = self.inodes.get(&ino) {
 			entry.fill_attr(out.attr());
 			out.ttl(TTL);
 
+			trace!("OK");
 			req.reply(out)
 		} else {
+			trace!("ENOENT: ino not in self.inodes");
 			req.reply_error(libc::ENOENT)
 		}
 	}
 
 	fn readlink(&self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
-		if let Some(entry) = self.inodes.get(&op.ino()) {
+		trace!("readlink()");
+
+		let ino = op.ino();
+
+		trace!("ino = {}", ino);
+
+		if let Some(entry) = self.inodes.get(&ino) {
 			if let Some(symlink) = &entry.symlink {
+				trace!("OK");
 				req.reply(&symlink)
 			} else {
+				trace!("EINVAL: entry.symlink is None");
 				req.reply_error(libc::EINVAL)
 			}
 		} else {
+			trace!("ENOENT: ino not in self.inodes");
 			req.reply_error(libc::ENOENT)
 		}
 	}
 
 	fn open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
+		trace!("open()");
+
 		let ino = op.ino();
 
+		trace!("ino = {}", ino);
+
 		if ((op.flags() as i32) & libc::O_ACCMODE) != libc::O_RDONLY {
+			trace!("EACCES: flags != O_RDONLY");
 			return req.reply_error(libc::EACCES);
 		} else if self.directories.contains_key(&ino) {
+			trace!("EISDIR: ino in self.directories");
 			return req.reply_error(libc::EISDIR);
 		} else if !self.inodes.contains_key(&ino) {
+			trace!("ENOENT: ino not in self.inodes");
 			return req.reply_error(libc::ENOENT);
 		} else {
 			let mut entry = ArchiveEntry::new();
 			let a = match Archive::read_open_filename(&self.archive_path, BLOCK_SIZE, self.password.as_deref()) {
 				Ok(a) => a,
-				Err(e) => return req.reply_error(e.errno),
+				Err(e) => {
+					trace!("ERROR (read_open_filename): {}", e);
+					return req.reply_error(e.errno);
+				},
 			};
 
 			let target_name = &self.inodes[&ino].entry_name;
@@ -184,6 +221,8 @@ impl ArchiveFS {
 				if &entry_name == target_name {
 					let fh = self.counter;
 					self.counter += 1;
+
+					trace!("fh = {}", fh);
 
 					self.opened_files.insert(fh, OpenedArchive {
 						entry_name: String::from(target_name),
@@ -196,30 +235,46 @@ impl ArchiveFS {
 					out.fh(fh);
 					out.keep_cache(true);
 
+					trace!("OK");
 					return req.reply(out);
 				}
 			}
 
+			trace!("ENOENT: entry_name not found in archive");
 			req.reply_error(libc::ENOENT)
 		}
 	}
 
 	fn read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
-		if let Some(archive) = self.opened_files.get_mut(&op.fh()) {
-			let offset = op.offset() as usize;
-			let size = op.size() as usize;
+		trace!("read()");
 
+		let fh = op.fh();
+		let offset = op.offset() as usize;
+		let size = op.size() as usize;
+
+		trace!("fh = {}", fh);
+		trace!("offset = {}", offset);
+		trace!("size = {}", size);
+
+		if let Some(archive) = self.opened_files.get_mut(&fh) {
 			if size == 0 {
+				trace!("OK (size == 0)");
 				return req.reply(&[]);
 			}
+
+			trace!("archive.position = {}", archive.position);
 
 			if offset < archive.position {
 				// The requested offset is lower than the current position:
 				// We have to close the current archive, open a new one and seek until the offset
+				trace!("offset < archive.position");
 				let mut entry = ArchiveEntry::new();
 				let a = match Archive::read_open_filename(&self.archive_path, BLOCK_SIZE, self.password.as_deref()) {
 					Ok(a) => a,
-					Err(e) => return req.reply_error(e.errno),
+					Err(e) => {
+						trace!("ERROR (read_open_filename): {}", e);
+						return req.reply_error(e.errno);
+					},
 				};
 
 				let mut found = false;
@@ -235,11 +290,13 @@ impl ArchiveFS {
 				}
 
 				if !found {
+					trace!("ENOENT: entry_name not found in archive");
 					return req.reply_error(libc::ENOENT);
 				}
 			}
 
 			if offset > archive.position {
+				trace!("offset > archive.position");
 				// The requested offset is greater than the current position:
 				// Read and discard until we get to the correct offset
 				let mut bytes_remaining = offset - archive.position;
@@ -252,10 +309,14 @@ impl ArchiveFS {
 
 							// If we read 0, then we reached the end of file
 							if bytes_read == 0 {
+								trace!("OK ([1] reached end of file)");
 								return req.reply(&[]);
 							}
 						},
-						Err(e) => return req.reply_error(e.errno),
+						Err(e) => {
+							trace!("ERROR ([1] archive.read_data): {}", e);
+							return req.reply_error(e.errno);
+						},
 					}
 				}
 
@@ -267,10 +328,14 @@ impl ArchiveFS {
 
 							// If we read 0, then we reached the end of file
 							if bytes_read == 0 {
+								trace!("OK ([2] reached end of file)");
 								return req.reply(&[]);
 							}
 						},
-						Err(e) => return req.reply_error(e.errno),
+						Err(e) => {
+							trace!("ERROR ([2] archive.read_data): {}", e);
+							return req.reply_error(e.errno);
+						},
 					}
 				}
 			}
@@ -286,30 +351,49 @@ impl ArchiveFS {
 
 						// If we read 0, then we reached the end of file
 						if bytes_read == 0 {
+							trace!("OK ([3] reached end of file)");
 							return req.reply(&data[..total_bytes]);
 						}
 					},
-					Err(e) => return req.reply_error(e.errno),
+					Err(e) => {
+						trace!("ERROR ([3] archive.read_data): {}", e);
+						return req.reply_error(e.errno);
+					},
 				}
 			}
 
+			trace!("OK");
 			req.reply(data)
 		} else {
+			trace!("ENOENT: fh not in self.opened_files");
 			req.reply_error(libc::ENOENT)
 		}
 	}
 
 	fn release(&mut self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
-		let _file = self.opened_files.remove(&op.fh());
+		trace!("release()");
 
+		let fh = op.fh();
+
+		trace!("fh = {}", fh);
+
+		let _file = self.opened_files.remove(&fh);
+
+		trace!("OK");
 		req.reply(())
 	}
 
 	fn readdir(&self, req: &Request, op: op::Readdir<'_>) -> io::Result<()> {
+		trace!("readdir()");
+
 		let ino = op.ino();
 		let offset = op.offset();
 
+		trace!("ino = {}", ino);
+		trace!("offset = {}", offset);
+
 		if !self.directories.contains_key(&ino) {
+			trace!("ENOTDIR: ino not in self.directories");
 			return req.reply_error(libc::ENOTDIR);
 		}
 
@@ -352,10 +436,13 @@ impl ArchiveFS {
 			}
 		}
 
+		trace!("OK");
 		req.reply(out)
 	}
 
 	fn statfs(&self, req: &Request, _op: op::Statfs<'_>) -> io::Result<()> {
+		trace!("statfs()");
+
 		let mut out = StatfsOut::default();
 		let out_statfs = out.statfs();
 
@@ -368,11 +455,17 @@ impl ArchiveFS {
 		out_statfs.ffree(0);
 		out_statfs.namelen(255);
 
+		trace!("OK");
 		req.reply(out)
 	}
 }
 
 fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
+	let uid = unsafe { libc::geteuid() };
+	let gid = unsafe { libc::getegid() };
+	let mask = unsafe { libc::umask(0) };
+	unsafe { libc::umask(mask) };
+
 	// Inode number 1 is the root directory
 	fs.inodes.insert(ROOT_INO, DirEntry {
 		name: String::from(""),
@@ -385,10 +478,10 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 		atime: Duration::new(0, 0),
 		mtime: Duration::new(0, 0),
 		ctime: Duration::new(0, 0),
-		mode: libc::S_IFDIR | 0o555,
+		mode: libc::S_IFDIR | (0o777 & !mask),
 		nlink: 2,
-		uid: unsafe { libc::getuid() },
-		gid: unsafe { libc::getgid() },
+		uid: uid,
+		gid: gid,
 		rdev: 0,
 
 		parent: ROOT_INO,
@@ -606,7 +699,8 @@ fn main() -> Result<()> {
 		.arg(Arg::with_name("debug")
 			.short("d")
 			.long("debug")
-			.help("Enable debug output (implies -f)"))
+			.multiple(true)
+			.help("Enable debug output (implies -f, specify more than once for trace output)"))
 		.arg(Arg::with_name("o")
 			.short("o")
 			.multiple(true)
@@ -618,12 +712,11 @@ fn main() -> Result<()> {
 
 	// Configure logging as soon as possible
 	Builder::new()
-		.filter(None, {
-			if matches.is_present("debug") {
-				LevelFilter::Trace
-			} else {
-				LevelFilter::Off
-			}
+		.format(|buf, record| writeln!(buf, "{}", record.args()))
+		.filter(None, match matches.occurrences_of("debug") {
+			0 => LevelFilter::Off,
+			1 => LevelFilter::Debug,
+			_ => LevelFilter::Trace,
 		})
 		.write_style(WriteStyle::Auto)
 		.init();
