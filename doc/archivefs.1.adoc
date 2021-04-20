@@ -1,0 +1,87 @@
+= ARCHIVEFS(1)
+:doctype: manpage
+:author: Franco Bugnano
+:man source: archivefs
+:man version: 1.0.0
+:man manual: archivefs manual
+:revdate: 2021-04-20
+
+
+== NAME
+archivefs - Mount an archive file as a read-only file system
+
+
+== SYNOPSIS
+*archivefs* [_OPTIONS_] _ARCHIVEPATH_ _MOUNTPOINT_
+
+
+== DESCRIPTION
+A read-only FUSE filesystem for mounting compressed archives, inspired by archivemount
+
+
+== OPTIONS
+*-h, --help*::
+	Prints help information
+*-V, --version*::
+	Prints version information
+*-p, --password*::
+	Open a password encrypted archive (The password will be read from STDIN)
+*-f, --foreground*::
+	Foreground operation
+*-d, --debug*::
+	Enable debug output (implies -f, specify more than once for trace output)
+*-o* _OPTION_::
+	*fuse*(8) mount option (specify more than once for more than one option)
+
+
+== EXAMPLE SESSION
+Consider the gzipped tar archive _files.tgz_ containing files _file1_ and
+_file2_, and an empty directory _mnt_.
+
+[source,bash]
+----
+$ ls
+files.tgz    mnt/
+
+# Mount the archive file
+$ archivefs files.tgz mnt
+
+$ ls mnt
+file1    file2
+
+# Perform desired read operations on the archive via mnt/
+# For example, to extract a file simply copy it
+$ cp mnt/file1 ~/
+
+# Unmount the archive when done
+$ umount mnt
+----
+
+
+== ARCHIVE FORMATS
+Archivefs supports all the formats supported by *libarchive*(3), including, but
+not limited to:
+
+* tar (compressed with gzip, bzip2, xz, zstd)
+* cpio
+* ISO9660 (including Joliet and Rockridge extensions)
+* zip
+* 7-Zip
+
+Note that libarchive has known bugs when reading rar archives.
+
+
+== RESOURCES
+GitHub: <https://github.com/bugnano/archivefs>
+
+crates.io: <https://crates.io/crates/archivefs>
+
+
+== SEE ALSO
+*fuse*(8), *umount*(8)
+
+
+== COPYING
+Copyright \(C) 2021 Franco Bugnano. Free use of this software is
+granted under the terms of the GNU General Public License (GPL).
+

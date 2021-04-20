@@ -734,7 +734,7 @@ fn main() -> Result<()> {
 		.arg(Arg::with_name("password")
 			.short("p")
 			.long("password")
-			.help("Open a password encrypted archive"))
+			.help("Open a password encrypted archive (The password will be read from STDIN)"))
 		.arg(Arg::with_name("foreground")
 			.short("f")
 			.long("foreground")
@@ -750,7 +750,7 @@ fn main() -> Result<()> {
 			.takes_value(true)
 			.number_of_values(1)
 			.value_name("OPTION")
-			.help("FUSE mount option"))
+			.help("FUSE mount option (specify more than once for more than one option)"))
 		.get_matches();
 
 	// Configure logging as soon as possible
