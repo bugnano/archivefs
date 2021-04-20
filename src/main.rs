@@ -485,9 +485,11 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 		rdev: 0,
 
 		parent: ROOT_INO,
-		entry_name: String::from("/"),
+		entry_name: String::from(""),
 		symlink: None,
 	});
+
+	fs.directories.insert(ROOT_INO, DirContents::new());
 
 	// File inode numbers start from 2
 	let mut counter: u64 = 2;
@@ -533,20 +535,59 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 
 		// Get directory and file name
 		let name: &str;
-		let parent: u64;
+		let mut parent = ROOT_INO;
 		if let Some(pos) = full_name.rfind('/') {
-			let (parent_name, basename) = full_name.split_at(pos);
+			name = &full_name[pos+1..];
 
-			name = &basename[1..];
+			for i_parent in full_name.match_indices('/') {
+				let parent_name = &full_name[..i_parent.0];
 
-			if let Some(&parent_ino) = ino_from_dir.get(parent_name) {
-				parent = parent_ino;
-			} else {
-				// This file refers to a directory that has not yet been listed in the archive
-				// Create the entry and hope that it will appear in a later read_next_header call
-				ino_from_dir.insert(String::from(parent_name), counter);
-				parent = counter;
-				counter += 1;
+				if let Some(&parent_ino) = ino_from_dir.get(parent_name) {
+					parent = parent_ino;
+				} else {
+					// This file refers to a directory that has not yet been listed in the archive
+					// Create the entry with a default value that will be changed if it will appear
+					// in a later read_next_header call
+					let temp_name = {
+						if let Some(pos) = parent_name.rfind('/') {
+							&parent_name[pos+1..]
+						} else {
+							parent_name
+						}
+					};
+
+					ino_from_dir.insert(String::from(parent_name), counter);
+					fs.directories.insert(counter, DirContents::new());
+
+					let dir_contents = fs.directories.get_mut(&parent).unwrap();
+					dir_contents.children.push(counter);
+					dir_contents.ino_from_name.insert(String::from(temp_name), counter);
+
+					fs.inodes.insert(counter, DirEntry {
+						name: String::from(temp_name),
+						ino: counter,
+						typ: libc::DT_DIR as u32,
+
+						size: 0,
+						blksize: 512,
+						blocks: 0,
+						atime: Duration::new(0, 0),
+						mtime: Duration::new(0, 0),
+						ctime: Duration::new(0, 0),
+						mode: libc::S_IFDIR | (0o777 & !mask),
+						nlink: 2,
+						uid: uid,
+						gid: gid,
+						rdev: 0,
+
+						parent: parent,
+						entry_name: String::from(""),
+						symlink: None,
+					});
+
+					parent = counter;
+					counter += 1;
+				}
 			}
 		} else {
 			name = &full_name;
@@ -569,8 +610,10 @@ fn populate_filesystem(fs: &mut ArchiveFS) -> Result<()>  {
 		}
 
 		let dir_contents = fs.directories.entry(parent).or_insert(DirContents::new());
-		dir_contents.children.push(ino);
-		dir_contents.ino_from_name.insert(String::from(name), ino);
+		if !dir_contents.children.contains(&ino) {
+			dir_contents.children.push(ino);
+			dir_contents.ino_from_name.insert(String::from(name), ino);
+		}
 
 		ino_from_entry_name.insert(String::from(&entry_name), ino);
 
@@ -760,6 +803,9 @@ fn main() -> Result<()> {
 			config.mount_option(option);
 		}
 	}
+
+	config.mount_option("ro");
+	config.mount_option("fsname=archivefs");
 
 	let session = Session::mount(mountpoint, config)?;
 
